@@ -11,6 +11,20 @@ As a software engineer with limited C++ expertise, I directed the development of
 
 ---
 
+## 📸 Screenshots
+
+### Main screen
+
+![alt text](./images/main-screen.png)
+
+### Video stream creation
+
+![alt text](./images/video-tream-creator.png)
+
+### Audio stream creation
+
+![alt text](/images/audio-stream-creator.png)
+
 ## ✨ Features
 
 - **🎥 Video Streaming** – Capture any screen/window via PipeWire (Linux) with configurable:
@@ -209,7 +223,7 @@ Contributions are welcome! Please follow these steps:
 
 ## 📄 License
 
-This project is licensed under the GNU General Public License v3.0 – see the LICENSE file for details.
+This project is licensed under the GNU General Public License v3.0 – see the [LICENSE](./LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
