@@ -1,0 +1,1378 @@
+// main.cpp - Main GUI application with custom names, pin/save, tray fix
+#include <QApplication>
+#include <QMainWindow>
+#include <QWidget>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QFormLayout>
+#include <QPushButton>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QHeaderView>
+#include <QDialog>
+#include <QLineEdit>
+#include <QSpinBox>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QLabel>
+#include <QDialogButtonBox>
+#include <QDebug>
+#include <QProcess>
+#include <QTimer>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QIcon>
+#include <QFile>
+#include <QCoreApplication>
+#include <QPixmap>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QCloseEvent>
+#include <QMap>
+#include <QStandardPaths>
+#include <QDir>
+
+// ======================================================================
+// Video Stream Configuration (with custom name)
+// ======================================================================
+struct VideoStreamConfig
+{
+    // Core
+    int width;
+    int height;
+    int bitrate;
+    QString host;
+    int port;
+    bool useVideoConvert;
+    QString customName; // user-provided stream name
+
+    // Encoder selection
+    QString encoder;
+    bool useHardware;
+
+    // x264 specific
+    QString speedPreset;
+    QString tune;
+    QString profile;
+
+    // Hardware encoder common
+    int qualityLevel;
+    QString rateControl;
+
+    QJsonObject toJson() const
+    {
+        QJsonObject obj;
+        obj["width"] = width;
+        obj["height"] = height;
+        obj["bitrate"] = bitrate;
+        obj["host"] = host;
+        obj["port"] = port;
+        obj["useVideoConvert"] = useVideoConvert;
+        obj["customName"] = customName;
+        obj["encoder"] = encoder;
+        obj["speedPreset"] = speedPreset;
+        obj["tune"] = tune;
+        obj["profile"] = profile;
+        obj["qualityLevel"] = qualityLevel;
+        obj["rateControl"] = rateControl;
+        return obj;
+    }
+
+    static VideoStreamConfig fromJson(const QJsonObject &obj)
+    {
+        VideoStreamConfig cfg;
+        cfg.width = obj["width"].toInt();
+        cfg.height = obj["height"].toInt();
+        cfg.bitrate = obj["bitrate"].toInt();
+        cfg.host = obj["host"].toString();
+        cfg.port = obj["port"].toInt();
+        cfg.useVideoConvert = obj["useVideoConvert"].toBool();
+        cfg.customName = obj["customName"].toString();
+        cfg.encoder = obj["encoder"].toString();
+        cfg.speedPreset = obj["speedPreset"].toString();
+        cfg.tune = obj["tune"].toString();
+        cfg.profile = obj["profile"].toString();
+        cfg.qualityLevel = obj["qualityLevel"].toInt();
+        cfg.rateControl = obj["rateControl"].toString();
+        return cfg;
+    }
+};
+
+// ======================================================================
+// Audio Stream Configuration (with custom name)
+// ======================================================================
+struct AudioStreamConfig
+{
+    QString host;
+    int port;
+    QString codec;
+    int bitrate;
+    int channels;
+    int sampleRate;
+    QString opusApplication;
+    QString customName; // user-provided stream name
+
+    QJsonObject toJson() const
+    {
+        QJsonObject obj;
+        obj["host"] = host;
+        obj["port"] = port;
+        obj["codec"] = codec;
+        obj["bitrate"] = bitrate;
+        obj["channels"] = channels;
+        obj["sampleRate"] = sampleRate;
+        obj["opusApplication"] = opusApplication;
+        obj["customName"] = customName;
+        return obj;
+    }
+
+    static AudioStreamConfig fromJson(const QJsonObject &obj)
+    {
+        AudioStreamConfig cfg;
+        cfg.host = obj["host"].toString();
+        cfg.port = obj["port"].toInt();
+        cfg.codec = obj["codec"].toString();
+        cfg.bitrate = obj["bitrate"].toInt();
+        cfg.channels = obj["channels"].toInt();
+        cfg.sampleRate = obj["sampleRate"].toInt();
+        cfg.opusApplication = obj["opusApplication"].toString();
+        cfg.customName = obj["customName"].toString();
+        return cfg;
+    }
+
+    static AudioStreamConfig defaultConfig()
+    {
+        AudioStreamConfig cfg;
+        cfg.host = "192.168.178.91";
+        cfg.port = 5020;
+        cfg.codec = "opus";
+        cfg.bitrate = 128;
+        cfg.channels = 2;
+        cfg.sampleRate = 48000;
+        cfg.opusApplication = "audio";
+        return cfg;
+    }
+};
+
+// ======================================================================
+// Stream Info
+// ======================================================================
+struct StreamInfo
+{
+    QString type;
+    QString name;
+    QProcess *workerProcess;
+    VideoStreamConfig videoConfig;
+    AudioStreamConfig audioConfig;
+    bool pinned; // is this stream saved for auto-start?
+};
+
+// ======================================================================
+// Video Stream Configuration Dialog (with custom name field)
+// ======================================================================
+class VideoStreamDialog : public QDialog
+{
+    Q_OBJECT
+
+public:
+    VideoStreamDialog(QWidget *parent = nullptr);
+    VideoStreamConfig getConfig() const;
+
+private slots:
+    void onEncoderChanged(int index);
+    void onHardwareToggled(bool checked);
+
+private:
+    // Core widgets
+    QSpinBox *spinWidth;
+    QSpinBox *spinHeight;
+    QSpinBox *spinBitrate;
+    QLineEdit *editHost;
+    QSpinBox *spinPort;
+    QCheckBox *checkVideoConvert;
+    QLineEdit *editCustomName; // NEW
+
+    // Encoder selection
+    QComboBox *comboEncoder;
+    QCheckBox *checkHardware;
+
+    // Software x264 widgets
+    QComboBox *comboSpeedPreset;
+    QComboBox *comboTune;
+    QComboBox *comboProfile;
+    QWidget *swX264Widget;
+
+    // Hardware encoder widgets
+    QSpinBox *spinQuality;
+    QComboBox *comboRateControl;
+    QWidget *hwWidget;
+
+    QVBoxLayout *mainLayout;
+    QFormLayout *formLayout;
+};
+
+VideoStreamDialog::VideoStreamDialog(QWidget *parent) : QDialog(parent)
+{
+    setWindowTitle("🎥 Video Stream Configuration");
+    setMinimumWidth(550);
+
+    mainLayout = new QVBoxLayout(this);
+    formLayout = new QFormLayout();
+
+    // ---- Custom stream name ----
+    editCustomName = new QLineEdit();
+    editCustomName->setPlaceholderText("Leave empty for auto-name (e.g. qt-caster-video-1)");
+    formLayout->addRow("📛 Stream Name:", editCustomName);
+
+    // ---- Resolution ----
+    QHBoxLayout *resLayout = new QHBoxLayout();
+    spinWidth = new QSpinBox();
+    spinWidth->setRange(320, 7680);
+    spinWidth->setValue(1920);
+    spinWidth->setSuffix(" px");
+    spinHeight = new QSpinBox();
+    spinHeight->setRange(240, 4320);
+    spinHeight->setValue(1080);
+    spinHeight->setSuffix(" px");
+    resLayout->addWidget(new QLabel("📏 Width:"));
+    resLayout->addWidget(spinWidth);
+    resLayout->addWidget(new QLabel("📏 Height:"));
+    resLayout->addWidget(spinHeight);
+    formLayout->addRow("Resolution:", resLayout);
+
+    // ---- Bitrate ----
+    spinBitrate = new QSpinBox();
+    spinBitrate->setRange(500, 100000);
+    spinBitrate->setValue(30000);
+    spinBitrate->setSuffix(" kbps");
+    formLayout->addRow("⚡ Bitrate:", spinBitrate);
+
+    // ---- Network ----
+    editHost = new QLineEdit("192.168.178.91");
+    formLayout->addRow("🌐 Destination Host:", editHost);
+    spinPort = new QSpinBox();
+    spinPort->setRange(1024, 65535);
+    spinPort->setValue(5010);
+    formLayout->addRow("🔌 Destination Port:", spinPort);
+
+    // ---- Video convert ----
+    checkVideoConvert = new QCheckBox("Use videoconvert");
+    checkVideoConvert->setChecked(true);
+    formLayout->addRow("🔄 Video Processing:", checkVideoConvert);
+
+    // ---- Hardware acceleration toggle ----
+    checkHardware = new QCheckBox("Use hardware acceleration (if available)");
+    checkHardware->setChecked(false);
+    connect(checkHardware, &QCheckBox::toggled, this, &VideoStreamDialog::onHardwareToggled);
+    formLayout->addRow("⚙️ Acceleration:", checkHardware);
+
+    // ---- Encoder selection ----
+    comboEncoder = new QComboBox();
+    comboEncoder->addItem("Software (x264)", "x264enc");
+    comboEncoder->addItem("VAAPI H.264", "vaapih264enc");
+    comboEncoder->addItem("NVENC H.264", "nvh264enc");
+    comboEncoder->addItem("QSV H.264", "qsvh264enc");
+    connect(comboEncoder, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &VideoStreamDialog::onEncoderChanged);
+    formLayout->addRow("🎛 Encoder:", comboEncoder);
+
+    mainLayout->addLayout(formLayout);
+
+    // ---- Encoder-specific option panels ----
+    // Software x264 panel
+    swX264Widget = new QWidget();
+    QFormLayout *swLayout = new QFormLayout(swX264Widget);
+    comboSpeedPreset = new QComboBox();
+    comboSpeedPreset->addItems({"ultrafast", "superfast", "veryfast", "faster",
+                                "fast", "medium", "slow", "slower", "veryslow"});
+    comboSpeedPreset->setCurrentText("ultrafast");
+    swLayout->addRow("⏩ Speed Preset:", comboSpeedPreset);
+    comboTune = new QComboBox();
+    comboTune->addItems({"zerolatency", "film", "animation", "grain", "stillimage", "fastdecode"});
+    comboTune->setCurrentText("zerolatency");
+    swLayout->addRow("🎛 Tune:", comboTune);
+    comboProfile = new QComboBox();
+    comboProfile->addItems({"baseline", "main", "high"});
+    comboProfile->setCurrentText("high");
+    swLayout->addRow("📊 Profile:", comboProfile);
+    mainLayout->addWidget(swX264Widget);
+
+    // Hardware panel
+    hwWidget = new QWidget();
+    QFormLayout *hwLayout = new QFormLayout(hwWidget);
+    spinQuality = new QSpinBox();
+    spinQuality->setRange(0, 51);
+    spinQuality->setValue(20);
+    spinQuality->setSuffix(" (lower = better)");
+    hwLayout->addRow("🎚 Quality:", spinQuality);
+    comboRateControl = new QComboBox();
+    comboRateControl->addItem("CBR", "cbr");
+    comboRateControl->addItem("VBR", "vbr");
+    comboRateControl->addItem("CQP", "cqp");
+    comboRateControl->setCurrentText("cbr");
+    hwLayout->addRow("📈 Rate Control:", comboRateControl);
+    mainLayout->addWidget(hwWidget);
+
+    // ---- Button box ----
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttonBox->button(QDialogButtonBox::Ok)->setText("✅ Start");
+    buttonBox->button(QDialogButtonBox::Cancel)->setText("❌ Cancel");
+    connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    mainLayout->addWidget(buttonBox);
+
+    // Initial state
+    onHardwareToggled(false);
+    onEncoderChanged(0);
+}
+
+void VideoStreamDialog::onHardwareToggled(bool checked)
+{
+    comboEncoder->setEnabled(checked);
+    if (!checked)
+    {
+        comboEncoder->setCurrentIndex(0);
+        comboEncoder->setEnabled(false);
+    }
+}
+
+void VideoStreamDialog::onEncoderChanged(int index)
+{
+    QString encoder = comboEncoder->currentData().toString();
+    bool isSoftware = (encoder == "x264enc");
+    swX264Widget->setVisible(isSoftware);
+    hwWidget->setVisible(!isSoftware);
+}
+
+VideoStreamConfig VideoStreamDialog::getConfig() const
+{
+    VideoStreamConfig cfg;
+    cfg.customName = editCustomName->text().trimmed();
+    cfg.width = spinWidth->value();
+    cfg.height = spinHeight->value();
+    cfg.bitrate = spinBitrate->value();
+    cfg.host = editHost->text();
+    cfg.port = spinPort->value();
+    cfg.useVideoConvert = checkVideoConvert->isChecked();
+    cfg.encoder = comboEncoder->currentData().toString();
+    cfg.useHardware = checkHardware->isChecked();
+    cfg.speedPreset = comboSpeedPreset->currentText();
+    cfg.tune = comboTune->currentText();
+    cfg.profile = comboProfile->currentText();
+    cfg.qualityLevel = spinQuality->value();
+    cfg.rateControl = comboRateControl->currentData().toString();
+    return cfg;
+}
+
+// ======================================================================
+// Audio Stream Configuration Dialog (with custom name field)
+// ======================================================================
+class AudioStreamDialog : public QDialog
+{
+    Q_OBJECT
+
+public:
+    AudioStreamDialog(QWidget *parent = nullptr);
+    AudioStreamConfig getConfig() const;
+
+private slots:
+    void onCodecChanged(int index);
+
+private:
+    QLineEdit *editCustomName; // NEW
+    QLineEdit *editHost;
+    QSpinBox *spinPort;
+    QComboBox *comboCodec;
+    QSpinBox *spinBitrate;
+    QSpinBox *spinChannels;
+    QComboBox *comboSampleRate;
+    QComboBox *comboOpusApplication;
+};
+
+AudioStreamDialog::AudioStreamDialog(QWidget *parent)
+    : QDialog(parent)
+{
+    setWindowTitle("🎤 Audio Stream Configuration");
+    setMinimumWidth(450);
+
+    QVBoxLayout *mainLayout = new QVBoxLayout(this);
+    QFormLayout *formLayout = new QFormLayout();
+
+    // ---- Custom stream name ----
+    editCustomName = new QLineEdit();
+    editCustomName->setPlaceholderText("Leave empty for auto-name (e.g. qt-caster-audio-1)");
+    formLayout->addRow("📛 Stream Name:", editCustomName);
+
+    editHost = new QLineEdit();
+    editHost->setText("192.168.178.91");
+    formLayout->addRow("🌐 Destination Host:", editHost);
+
+    spinPort = new QSpinBox();
+    spinPort->setRange(1024, 65535);
+    spinPort->setValue(5020);
+    formLayout->addRow("🔌 Destination Port:", spinPort);
+
+    comboCodec = new QComboBox();
+    comboCodec->addItem("🎵 Opus", "opus");
+    comboCodec->addItem("🎶 AAC", "aac");
+    formLayout->addRow("🎛 Codec:", comboCodec);
+
+    spinBitrate = new QSpinBox();
+    spinBitrate->setRange(16, 512);
+    spinBitrate->setValue(128);
+    spinBitrate->setSuffix(" kbps");
+    formLayout->addRow("⚡ Bitrate:", spinBitrate);
+
+    spinChannels = new QSpinBox();
+    spinChannels->setRange(1, 8);
+    spinChannels->setValue(2);
+    spinChannels->setSuffix(" ch");
+    formLayout->addRow("🎧 Channels:", spinChannels);
+
+    comboSampleRate = new QComboBox();
+    comboSampleRate->addItem("48 kHz", 48000);
+    comboSampleRate->addItem("44.1 kHz", 44100);
+    comboSampleRate->addItem("96 kHz", 96000);
+    comboSampleRate->setCurrentIndex(0);
+    formLayout->addRow("⏱ Sample Rate:", comboSampleRate);
+
+    comboOpusApplication = new QComboBox();
+    comboOpusApplication->addItem("🎼 Audio", "audio");
+    comboOpusApplication->addItem("🎤 VoIP", "voip");
+    comboOpusApplication->addItem("⚡ Low Delay", "lowdelay");
+    formLayout->addRow("📱 Application:", comboOpusApplication);
+
+    connect(comboCodec, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &AudioStreamDialog::onCodecChanged);
+    onCodecChanged(0);
+
+    mainLayout->addLayout(formLayout);
+
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttonBox->button(QDialogButtonBox::Ok)->setText("✅ Start");
+    buttonBox->button(QDialogButtonBox::Cancel)->setText("❌ Cancel");
+    connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    mainLayout->addWidget(buttonBox);
+}
+
+void AudioStreamDialog::onCodecChanged(int index)
+{
+    QString codec = comboCodec->itemData(index).toString();
+    comboOpusApplication->setEnabled(codec == "opus");
+    if (codec == "opus")
+    {
+        spinBitrate->setRange(16, 512);
+        spinBitrate->setValue(128);
+    }
+    else
+    {
+        spinBitrate->setRange(32, 512);
+        spinBitrate->setValue(192);
+    }
+}
+
+AudioStreamConfig AudioStreamDialog::getConfig() const
+{
+    AudioStreamConfig config;
+    config.customName = editCustomName->text().trimmed();
+    config.host = editHost->text();
+    config.port = spinPort->value();
+    config.codec = comboCodec->currentData().toString();
+    config.bitrate = spinBitrate->value();
+    config.channels = spinChannels->value();
+    config.sampleRate = comboSampleRate->currentData().toInt();
+    config.opusApplication = comboOpusApplication->currentData().toString();
+    return config;
+}
+
+// ======================================================================
+// StreamManager - Main Window
+// ======================================================================
+class StreamManager : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    static StreamManager *instance;     // for signal handler
+    static void signalHandler(int sig); // static signal handler
+
+    StreamManager(QWidget *parent = nullptr);
+    ~StreamManager();
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
+
+private slots:
+    void createVideoStream();
+    void createAudioStream();
+    void onStreamDoubleClicked(int row, int column);
+    void onTrayIconActivated(QSystemTrayIcon::ActivationReason reason);
+    void minimizeToTray();
+    void quitApplication();
+    void onWorkerOutput();
+    void onWorkerFinished(int exitCode, QProcess::ExitStatus exitStatus);
+    void updateStreamTable();
+    void rebuildTrayMenu();
+    void stopStreamFromTray();
+    void updateTrayTooltip();
+    void onPinToggled(int row, int column); // NEW
+    void onTrayMenuAboutToShow();           // NEW
+    void cleanupAndQuit();                  // NEW
+
+private:
+    void setupSystemTray();
+    void setupTable();
+    void loadSavedStreams();                         // NEW
+    void saveStreamConfig(const StreamInfo &stream); // NEW
+    void removeSavedStream(const QString &name);     // NEW
+    QString getConfigFilePath() const;               // NEW
+    void terminateAllStreams();                      // NEW: shared cleanup logic
+
+    QPushButton *btnCreateVideo;
+    QPushButton *btnCreateAudio;
+    QPushButton *btnMinimize;
+    QPushButton *btnQuit;
+    QTableWidget *streamTable;
+
+    QList<StreamInfo> activeStreams;
+    int videoStreamCounter;
+    int audioStreamCounter;
+
+    QSystemTrayIcon *trayIcon;
+    QMenu *trayMenu;
+    QTimer *statusTimer;
+
+    QMap<QAction *, int> trayStreamActions;
+
+    bool m_isQuitting; // ← NEW: flag to distinguish close vs quit
+};
+
+// Static member definition
+StreamManager *StreamManager::instance = nullptr;
+
+StreamManager::StreamManager(QWidget *parent)
+    : QMainWindow(parent),
+      videoStreamCounter(0),
+      audioStreamCounter(0),
+      trayIcon(nullptr),
+      trayMenu(nullptr),
+      statusTimer(nullptr),
+      m_isQuitting(false)
+{
+    instance = this; // set static instance
+
+    setWindowTitle("🎬 Qt-Caster Stream Manager");
+    resize(950, 600); // slightly wider for pin column
+
+    QWidget *centralWidget = new QWidget(this);
+    setCentralWidget(centralWidget);
+
+    QVBoxLayout *mainLayout = new QVBoxLayout(centralWidget);
+
+    QHBoxLayout *buttonLayout = new QHBoxLayout();
+    btnCreateVideo = new QPushButton("🎥 Create Video Stream", this);
+    btnCreateAudio = new QPushButton("🎤 Create Audio Stream", this);
+    buttonLayout->addWidget(btnCreateVideo);
+    buttonLayout->addWidget(btnCreateAudio);
+
+    streamTable = new QTableWidget(this);
+    setupTable();
+
+    QHBoxLayout *bottomButtonLayout = new QHBoxLayout();
+    btnMinimize = new QPushButton("⤵ Minimize to Tray", this);
+    btnQuit = new QPushButton("⏹ Quit Application", this);
+    bottomButtonLayout->addWidget(btnMinimize);
+    bottomButtonLayout->addWidget(btnQuit);
+
+    mainLayout->addLayout(buttonLayout);
+    mainLayout->addWidget(streamTable);
+    mainLayout->addLayout(bottomButtonLayout);
+
+    connect(btnCreateVideo, &QPushButton::clicked, this, &StreamManager::createVideoStream);
+    connect(btnCreateAudio, &QPushButton::clicked, this, &StreamManager::createAudioStream);
+    connect(btnMinimize, &QPushButton::clicked, this, &StreamManager::minimizeToTray);
+    connect(btnQuit, &QPushButton::clicked, this, &StreamManager::quitApplication);
+    connect(streamTable, &QTableWidget::cellDoubleClicked,
+            this, &StreamManager::onStreamDoubleClicked);
+    connect(streamTable, &QTableWidget::cellChanged, // NEW: detect pin toggle
+            this, &StreamManager::onPinToggled);
+
+    setupSystemTray();
+
+    // Update stream list every second
+    statusTimer = new QTimer(this);
+    statusTimer->setInterval(1000);
+    connect(statusTimer, &QTimer::timeout, this, &StreamManager::updateStreamTable);
+    statusTimer->start();
+
+    // Load saved pinned streams
+    loadSavedStreams();
+}
+
+// ----------------------------------------------------------------------
+// Destructor – clear global pointer
+// ----------------------------------------------------------------------
+StreamManager::~StreamManager()
+{
+    if (instance == this)
+        instance = nullptr;
+    // Cleanup is now handled by terminateAllStreams() called from cleanupAndQuit()
+}
+
+void StreamManager::setupTable()
+{
+    QStringList headers;
+    headers << "📛 Stream" << "🔄 Status" << "🌐 Destination" << "⚙️ Options" << "📊 Activity" << "📌 Pin";
+    streamTable->setColumnCount(headers.size());
+    streamTable->setHorizontalHeaderLabels(headers);
+    streamTable->verticalHeader()->setVisible(false);
+    streamTable->setAlternatingRowColors(false);
+    streamTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    streamTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+
+    // Column sizing
+    streamTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);          // Stream name
+    streamTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents); // Status
+    streamTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents); // Destination
+    streamTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);          // Options
+    streamTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents); // Activity
+    streamTable->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents); // Pin
+}
+
+void StreamManager::setupSystemTray()
+{
+    if (!QSystemTrayIcon::isSystemTrayAvailable())
+    {
+        qWarning() << "⚠️ System tray not available – tray icon disabled.";
+        trayIcon = nullptr;
+        return;
+    }
+
+    QString iconPath = QCoreApplication::applicationDirPath() + "/icon.png";
+    QIcon icon;
+    if (QFile::exists(iconPath))
+    {
+        icon = QIcon(iconPath);
+        qDebug() << "✅ Loaded tray icon from:" << iconPath;
+    }
+    else
+    {
+        QPixmap pixmap(64, 64);
+        pixmap.fill(Qt::darkBlue);
+        icon = QIcon(pixmap);
+        qDebug() << "ℹ️ Using default tray icon (icon.png not found)";
+    }
+
+    trayIcon = new QSystemTrayIcon(icon, this);
+    connect(trayIcon, &QSystemTrayIcon::activated, this, &StreamManager::onTrayIconActivated);
+
+    // Create menu but don't populate yet
+    trayMenu = new QMenu(this);
+    trayIcon->setContextMenu(trayMenu);
+    // Refresh menu when it's about to be shown
+    connect(trayMenu, &QMenu::aboutToShow, this, &StreamManager::onTrayMenuAboutToShow);
+
+    trayIcon->show();
+    updateTrayTooltip();
+}
+
+void StreamManager::rebuildTrayMenu()
+{
+    // This is now called from onTrayMenuAboutToShow, not manually.
+    // We keep the method for internal use if needed.
+}
+
+void StreamManager::onTrayMenuAboutToShow()
+{
+    if (!trayMenu)
+        return;
+
+    trayMenu->clear();
+    trayStreamActions.clear();
+
+    QAction *showAction = trayMenu->addAction("🪟 Show Window");
+    connect(showAction, &QAction::triggered, this, &QWidget::show);
+    trayMenu->addSeparator();
+
+    QAction *videoAction = trayMenu->addAction("🎥 Create Video Stream");
+    QAction *audioAction = trayMenu->addAction("🎤 Create Audio Stream");
+    connect(videoAction, &QAction::triggered, this, &StreamManager::createVideoStream);
+    connect(audioAction, &QAction::triggered, this, &StreamManager::createAudioStream);
+    trayMenu->addSeparator();
+
+    if (!activeStreams.isEmpty())
+    {
+        QMenu *streamsMenu = trayMenu->addMenu("📡 Active Streams");
+        for (int i = 0; i < activeStreams.size(); ++i)
+        {
+            const StreamInfo &stream = activeStreams[i];
+            bool isRunning = stream.workerProcess &&
+                             stream.workerProcess->state() == QProcess::Running;
+            QString statusIcon = isRunning ? "🟢" : "🔴";
+            QString text = QString("%1 %2").arg(statusIcon).arg(stream.name);
+            QAction *streamAction = streamsMenu->addAction(text);
+            streamAction->setData(i);
+            connect(streamAction, &QAction::triggered, this, &StreamManager::stopStreamFromTray);
+            trayStreamActions[streamAction] = i;
+        }
+    }
+
+    trayMenu->addSeparator();
+    QAction *quitAction = trayMenu->addAction("⏹ Quit");
+    connect(quitAction, &QAction::triggered, this, &StreamManager::quitApplication);
+}
+
+void StreamManager::stopStreamFromTray()
+{
+    QAction *action = qobject_cast<QAction *>(sender());
+    if (!action)
+        return;
+
+    int index = action->data().toInt();
+    if (index < 0 || index >= activeStreams.size())
+        return;
+
+    StreamInfo &stream = activeStreams[index];
+    qDebug() << "🛑 Stopping stream from tray:" << stream.name;
+
+    if (stream.workerProcess)
+    {
+        if (stream.workerProcess->state() == QProcess::Running)
+        {
+            stream.workerProcess->terminate();
+            if (!stream.workerProcess->waitForFinished(2000))
+            {
+                stream.workerProcess->kill();
+                stream.workerProcess->waitForFinished();
+            }
+        }
+        if (stream.workerProcess)
+        {
+            stream.workerProcess->deleteLater();
+            stream.workerProcess = nullptr;
+        }
+    }
+
+    activeStreams.removeAt(index);
+    updateStreamTable();
+    updateTrayTooltip();
+}
+
+void StreamManager::updateTrayTooltip()
+{
+    if (!trayIcon)
+        return;
+
+    QString tooltip = "🎬 Qt-Caster Stream Manager\n";
+    if (activeStreams.isEmpty())
+    {
+        tooltip += "📡 No active streams";
+    }
+    else
+    {
+        tooltip += "━━━━━━━━━━━━━━━━━━━━\n";
+        for (const StreamInfo &stream : activeStreams)
+        {
+            bool isRunning = stream.workerProcess &&
+                             stream.workerProcess->state() == QProcess::Running;
+            QString statusIcon = isRunning ? "🟢" : "🔴";
+            tooltip += QString("%1 %2\n").arg(statusIcon).arg(stream.name);
+        }
+    }
+    trayIcon->setToolTip(tooltip);
+}
+
+void StreamManager::closeEvent(QCloseEvent *event)
+{
+    if (m_isQuitting)
+    {
+        event->accept(); // actually close the window
+        return;
+    }
+
+    event->ignore();
+    hide();
+    if (trayIcon)
+    {
+        trayIcon->showMessage("🎬 Qt-Caster",
+                              "Application minimized to tray. Right-click the tray icon for options.",
+                              QSystemTrayIcon::Information, 2000);
+    }
+}
+
+void StreamManager::onTrayIconActivated(QSystemTrayIcon::ActivationReason reason)
+{
+    if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+    {
+        show();
+        raise();
+        activateWindow();
+    }
+}
+
+void StreamManager::minimizeToTray()
+{
+    hide();
+    if (trayIcon)
+    {
+        trayIcon->showMessage("🎬 Qt-Caster",
+                              "Application minimized to tray.",
+                              QSystemTrayIcon::Information, 2000);
+    }
+}
+
+// ----------------------------------------------------------------------
+// Common cleanup logic
+// ----------------------------------------------------------------------
+void StreamManager::terminateAllStreams()
+{
+    qDebug() << "🧹 Terminating all active streams...";
+
+    // Step 1: Collect all worker processes into a separate list
+    QList<QProcess *> processes;
+    for (const StreamInfo &stream : activeStreams)
+    {
+        if (stream.workerProcess)
+            processes.append(stream.workerProcess);
+    }
+
+    // Step 2: Terminate each process (no reliance on activeStreams)
+    for (QProcess *proc : processes)
+    {
+        if (proc->state() == QProcess::Running)
+        {
+            qDebug() << "   Stopping process";
+            proc->terminate();
+            if (!proc->waitForFinished(2000))
+            {
+                proc->kill();
+                proc->waitForFinished(1000);
+            }
+        }
+        proc->deleteLater();
+    }
+
+    // Step 3: Clear the list and update UI
+    activeStreams.clear();
+    updateStreamTable();
+    updateTrayTooltip();
+
+    qDebug() << "✅ All streams terminated.";
+}
+
+// ----------------------------------------------------------------------
+// Slot called from signal handler or Quit button
+// ----------------------------------------------------------------------
+void StreamManager::cleanupAndQuit()
+{
+    if (m_isQuitting)
+        return;          // prevent reentrancy
+    m_isQuitting = true; // set flag
+
+    qDebug() << "🛑 Starting graceful shutdown...";
+
+    // Hide tray icon immediately to prevent messages
+    if (trayIcon)
+    {
+        trayIcon->hide();
+        trayIcon->deleteLater();
+        trayIcon = nullptr;
+    }
+
+    terminateAllStreams();
+
+    // Quit the application
+    QApplication::quit();
+}
+
+// ----------------------------------------------------------------------
+// Replace quitApplication() to use cleanupAndQuit
+// ----------------------------------------------------------------------
+void StreamManager::quitApplication()
+{
+    cleanupAndQuit();
+}
+
+// ======================================================================
+// Stream Creation with Custom Name
+// ======================================================================
+void StreamManager::createVideoStream()
+{
+    qDebug() << "🎥 Creating video stream...";
+
+    VideoStreamDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        qDebug() << "❌ Video stream creation cancelled";
+        return;
+    }
+
+    VideoStreamConfig config = dialog.getConfig();
+
+    // Determine stream name
+    QString streamName;
+    if (!config.customName.isEmpty())
+    {
+        streamName = config.customName;
+    }
+    else
+    {
+        videoStreamCounter++;
+        streamName = QString("qt-caster-video-%1").arg(videoStreamCounter);
+    }
+
+    QProcess *worker = new QProcess(this);
+    QString workerPath = QCoreApplication::applicationDirPath() + "/qt-caster-worker";
+
+    QJsonObject configJson = config.toJson();
+    configJson["streamName"] = streamName;
+    configJson["type"] = "video";
+    QString configStr = QJsonDocument(configJson).toJson(QJsonDocument::Compact);
+
+    qDebug() << "🚀 Launching worker:" << workerPath;
+    qDebug() << "📄 Config:" << configStr;
+
+    worker->start(workerPath, QStringList() << configStr);
+
+    connect(worker, &QProcess::readyReadStandardOutput, this, &StreamManager::onWorkerOutput);
+    connect(worker, &QProcess::readyReadStandardError, this, &StreamManager::onWorkerOutput);
+    connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &StreamManager::onWorkerFinished);
+
+    StreamInfo info;
+    info.type = "Video";
+    info.name = streamName;
+    info.workerProcess = worker;
+    info.videoConfig = config;
+    info.pinned = false; // not pinned by default
+
+    activeStreams.append(info);
+    updateStreamTable();
+    updateTrayTooltip();
+}
+
+void StreamManager::createAudioStream()
+{
+    qDebug() << "🎤 Creating audio stream...";
+
+    AudioStreamDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        qDebug() << "❌ Audio stream creation cancelled";
+        return;
+    }
+
+    AudioStreamConfig config = dialog.getConfig();
+
+    // Determine stream name
+    QString streamName;
+    if (!config.customName.isEmpty())
+    {
+        streamName = config.customName;
+    }
+    else
+    {
+        audioStreamCounter++;
+        streamName = QString("qt-caster-audio-%1").arg(audioStreamCounter);
+    }
+
+    QProcess *worker = new QProcess(this);
+    QString workerPath = QCoreApplication::applicationDirPath() + "/qt-caster-worker";
+
+    QJsonObject configJson = config.toJson();
+    configJson["streamName"] = streamName;
+    configJson["type"] = "audio";
+    QString configStr = QJsonDocument(configJson).toJson(QJsonDocument::Compact);
+
+    qDebug() << "🚀 Launching worker:" << workerPath;
+    qDebug() << "📄 Config:" << configStr;
+
+    worker->start(workerPath, QStringList() << configStr);
+
+    connect(worker, &QProcess::readyReadStandardOutput, this, &StreamManager::onWorkerOutput);
+    connect(worker, &QProcess::readyReadStandardError, this, &StreamManager::onWorkerOutput);
+    connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &StreamManager::onWorkerFinished);
+
+    StreamInfo info;
+    info.type = "Audio";
+    info.name = streamName;
+    info.workerProcess = worker;
+    info.audioConfig = config;
+    info.pinned = false;
+
+    activeStreams.append(info);
+    updateStreamTable();
+    updateTrayTooltip();
+}
+
+void StreamManager::onWorkerOutput()
+{
+    QProcess *worker = qobject_cast<QProcess *>(sender());
+    if (worker)
+    {
+        QString output = worker->readAllStandardOutput();
+        QString error = worker->readAllStandardError();
+        if (!output.isEmpty())
+            qDebug().noquote() << "[Worker 📤]" << output.trimmed();
+        if (!error.isEmpty())
+            qDebug().noquote() << "[Worker ❌]" << error.trimmed();
+    }
+}
+
+void StreamManager::onWorkerFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    QProcess *worker = qobject_cast<QProcess *>(sender());
+    qDebug() << "🏁 Worker finished – code:" << exitCode << "status:" << exitStatus;
+
+    for (int i = 0; i < activeStreams.size(); ++i)
+    {
+        if (activeStreams[i].workerProcess == worker)
+        {
+            activeStreams[i].workerProcess = nullptr;
+            break;
+        }
+    }
+    updateStreamTable();
+    updateTrayTooltip();
+}
+
+// ======================================================================
+// Table Update with Pin Column
+// ======================================================================
+void StreamManager::updateStreamTable()
+{
+    streamTable->setRowCount(activeStreams.size());
+    streamTable->blockSignals(true); // prevent onPinToggled during population
+
+    for (int i = 0; i < activeStreams.size(); ++i)
+    {
+        const StreamInfo &stream = activeStreams[i];
+        bool isRunning = stream.workerProcess &&
+                         stream.workerProcess->state() == QProcess::Running;
+
+        // Column 0: Stream name
+        QString nameIcon = (stream.type == "Video") ? "📹" : "🎵";
+        QString displayName = QString("%1 %2").arg(nameIcon).arg(stream.name);
+        QTableWidgetItem *nameItem = new QTableWidgetItem(displayName);
+        nameItem->setData(Qt::UserRole, i);
+        nameItem->setToolTip(stream.type);
+        streamTable->setItem(i, 0, nameItem);
+
+        // Column 1: Status
+        QString statusText = isRunning ? "🟢 Running" : "🔴 Stopped";
+        QTableWidgetItem *statusItem = new QTableWidgetItem(statusText);
+        streamTable->setItem(i, 1, statusItem);
+
+        // Column 2: Destination
+        QString dest;
+        if (stream.type == "Video")
+        {
+            dest = QString("%1:%2").arg(stream.videoConfig.host).arg(stream.videoConfig.port);
+        }
+        else
+        {
+            dest = QString("%1:%2").arg(stream.audioConfig.host).arg(stream.audioConfig.port);
+        }
+        QTableWidgetItem *destItem = new QTableWidgetItem(dest);
+        streamTable->setItem(i, 2, destItem);
+
+        // Column 3: Options
+        QString opts;
+        if (stream.type == "Video")
+        {
+            opts = QString("%1x%2 @ %3 kbps, %4")
+                       .arg(stream.videoConfig.width)
+                       .arg(stream.videoConfig.height)
+                       .arg(stream.videoConfig.bitrate)
+                       .arg(stream.videoConfig.encoder);
+        }
+        else
+        {
+            opts = QString("%1, %2 kbps, %3ch")
+                       .arg(stream.audioConfig.codec.toUpper())
+                       .arg(stream.audioConfig.bitrate)
+                       .arg(stream.audioConfig.channels);
+        }
+        QTableWidgetItem *optsItem = new QTableWidgetItem(opts);
+        streamTable->setItem(i, 3, optsItem);
+
+        // Column 4: Activity
+        QTableWidgetItem *activityItem = new QTableWidgetItem();
+        activityItem->setText(isRunning ? "🟢" : "🔴");
+        activityItem->setTextAlignment(Qt::AlignCenter);
+        streamTable->setItem(i, 4, activityItem);
+
+        // Column 5: Pin checkbox
+        QTableWidgetItem *pinItem = new QTableWidgetItem();
+        pinItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
+        pinItem->setCheckState(stream.pinned ? Qt::Checked : Qt::Unchecked);
+        pinItem->setTextAlignment(Qt::AlignCenter);
+        streamTable->setItem(i, 5, pinItem);
+    }
+
+    streamTable->blockSignals(false);
+    streamTable->resizeColumnsToContents();
+    streamTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    streamTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+    streamTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    streamTable->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
+}
+
+void StreamManager::onStreamDoubleClicked(int row, int column)
+{
+    Q_UNUSED(column);
+    if (row < 0 || row >= activeStreams.size())
+        return;
+
+    StreamInfo &stream = activeStreams[row];
+
+    if (stream.workerProcess)
+    {
+        if (stream.workerProcess->state() == QProcess::Running)
+        {
+            qDebug() << "🛑 Stopping stream:" << stream.name;
+            stream.workerProcess->terminate();
+            if (!stream.workerProcess->waitForFinished(2000))
+            {
+                stream.workerProcess->kill();
+                stream.workerProcess->waitForFinished();
+            }
+        }
+        if (stream.workerProcess)
+        {
+            stream.workerProcess->deleteLater();
+            stream.workerProcess = nullptr;
+        }
+    }
+
+    // If stream was pinned, remove from saved config
+    if (stream.pinned)
+    {
+        removeSavedStream(stream.name);
+    }
+
+    activeStreams.removeAt(row);
+    updateStreamTable();
+    updateTrayTooltip();
+}
+
+// ======================================================================
+// Pin / Save Configuration
+// ======================================================================
+void StreamManager::onPinToggled(int row, int column)
+{
+    if (column != 5)
+        return; // only care about pin column
+
+    if (row < 0 || row >= activeStreams.size())
+        return;
+
+    StreamInfo &stream = activeStreams[row];
+    QTableWidgetItem *pinItem = streamTable->item(row, 5);
+    if (!pinItem)
+        return;
+
+    bool checked = (pinItem->checkState() == Qt::Checked);
+    if (stream.pinned == checked)
+        return; // no change
+
+    stream.pinned = checked;
+
+    if (checked)
+    {
+        // Save this stream configuration
+        saveStreamConfig(stream);
+        qDebug() << "📌 Pinned stream:" << stream.name;
+    }
+    else
+    {
+        // Remove from saved config
+        removeSavedStream(stream.name);
+        qDebug() << "❌ Unpinned stream:" << stream.name;
+    }
+}
+
+QString StreamManager::getConfigFilePath() const
+{
+    QString configDir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    if (configDir.isEmpty())
+        configDir = QDir::home().filePath(".config/qt-caster");
+    QDir dir(configDir);
+    if (!dir.exists())
+        dir.mkpath(".");
+    return configDir + "/saved-streams.json";
+}
+
+void StreamManager::saveStreamConfig(const StreamInfo &stream)
+{
+    QString path = getConfigFilePath();
+    QJsonObject root;
+
+    // Load existing file if any
+    QFile file(path);
+    if (file.exists() && file.open(QIODevice::ReadOnly))
+    {
+        QByteArray data = file.readAll();
+        file.close();
+        QJsonDocument doc = QJsonDocument::fromJson(data);
+        if (doc.isObject())
+            root = doc.object();
+    }
+
+    // Create entry for this stream
+    QJsonObject streamObj;
+    streamObj["type"] = stream.type;
+    streamObj["name"] = stream.name;
+
+    if (stream.type == "Video")
+    {
+        streamObj["config"] = stream.videoConfig.toJson();
+    }
+    else
+    {
+        streamObj["config"] = stream.audioConfig.toJson();
+    }
+
+    root[stream.name] = streamObj;
+
+    // Write back
+    if (file.open(QIODevice::WriteOnly))
+    {
+        QJsonDocument doc(root);
+        file.write(doc.toJson());
+        file.close();
+    }
+}
+
+void StreamManager::removeSavedStream(const QString &name)
+{
+    QString path = getConfigFilePath();
+    QFile file(path);
+    if (!file.exists())
+        return;
+
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+
+    QByteArray data = file.readAll();
+    file.close();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject())
+        return;
+
+    QJsonObject root = doc.object();
+    if (root.contains(name))
+    {
+        root.remove(name);
+        if (file.open(QIODevice::WriteOnly))
+        {
+            QJsonDocument newDoc(root);
+            file.write(newDoc.toJson());
+            file.close();
+        }
+    }
+}
+
+void StreamManager::loadSavedStreams()
+{
+    QString path = getConfigFilePath();
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+
+    QByteArray data = file.readAll();
+    file.close();
+    QJsonDocument doc = QJsonDocument::fromJson(data);
+    if (!doc.isObject())
+        return;
+
+    QJsonObject root = doc.object();
+    for (auto it = root.begin(); it != root.end(); ++it)
+    {
+        QJsonObject streamObj = it.value().toObject();
+        QString type = streamObj["type"].toString();
+        QString name = streamObj["name"].toString();
+        QJsonObject configObj = streamObj["config"].toObject();
+
+        if (type == "Video")
+        {
+            VideoStreamConfig cfg = VideoStreamConfig::fromJson(configObj);
+            // Re-create the stream
+            QProcess *worker = new QProcess(this);
+            QString workerPath = QCoreApplication::applicationDirPath() + "/qt-caster-worker";
+
+            QJsonObject configJson = cfg.toJson();
+            configJson["streamName"] = name;
+            configJson["type"] = "video";
+            QString configStr = QJsonDocument(configJson).toJson(QJsonDocument::Compact);
+
+            worker->start(workerPath, QStringList() << configStr);
+            connect(worker, &QProcess::readyReadStandardOutput, this, &StreamManager::onWorkerOutput);
+            connect(worker, &QProcess::readyReadStandardError, this, &StreamManager::onWorkerOutput);
+            connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                    this, &StreamManager::onWorkerFinished);
+
+            StreamInfo info;
+            info.type = "Video";
+            info.name = name;
+            info.workerProcess = worker;
+            info.videoConfig = cfg;
+            info.pinned = true; // mark as pinned
+
+            activeStreams.append(info);
+        }
+        else if (type == "Audio")
+        {
+            AudioStreamConfig cfg = AudioStreamConfig::fromJson(configObj);
+            QProcess *worker = new QProcess(this);
+            QString workerPath = QCoreApplication::applicationDirPath() + "/qt-caster-worker";
+
+            QJsonObject configJson = cfg.toJson();
+            configJson["streamName"] = name;
+            configJson["type"] = "audio";
+            QString configStr = QJsonDocument(configJson).toJson(QJsonDocument::Compact);
+
+            worker->start(workerPath, QStringList() << configStr);
+            connect(worker, &QProcess::readyReadStandardOutput, this, &StreamManager::onWorkerOutput);
+            connect(worker, &QProcess::readyReadStandardError, this, &StreamManager::onWorkerOutput);
+            connect(worker, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                    this, &StreamManager::onWorkerFinished);
+
+            StreamInfo info;
+            info.type = "Audio";
+            info.name = name;
+            info.workerProcess = worker;
+            info.audioConfig = cfg;
+            info.pinned = true;
+
+            activeStreams.append(info);
+        }
+    }
+
+    // Update counters based on names? We'll skip for simplicity.
+    // User may have custom names, counters are not critical.
+
+    updateStreamTable();
+    updateTrayTooltip();
+    qDebug() << "📂 Loaded" << activeStreams.size() << "saved streams.";
+}
+
+int main(int argc, char *argv[])
+{
+    QApplication app(argc, argv);
+    app.setQuitOnLastWindowClosed(false);
+    app.setApplicationName("Qt-Caster");
+    app.setApplicationDisplayName("🎬 Qt-Caster Stream Manager");
+    app.setOrganizationName("Qt-Caster"); // for QStandardPaths
+
+    StreamManager manager;
+    manager.show();
+
+    return app.exec();
+}
+
+#include "main.moc"
