@@ -32,6 +32,7 @@
 #include <QMap>
 #include <QStandardPaths>
 #include <QDir>
+#include <QGroupBox>
 
 // ======================================================================
 // Video Stream Configuration (with custom name)
@@ -112,6 +113,11 @@ struct AudioStreamConfig
     int sampleRate;
     QString opusApplication;
     QString customName; // user-provided stream name
+    QString direction;  // "outgoing" or "incoming"
+    QString sinkDevice; // PulseAudio sink name for incoming streams
+    int bufferSize;     // bytes, 0 = default
+    int latencyTime;    // ms, 0 = default
+    int bufferTime;     // ms, 0 = default
 
     QJsonObject toJson() const
     {
@@ -124,6 +130,11 @@ struct AudioStreamConfig
         obj["sampleRate"] = sampleRate;
         obj["opusApplication"] = opusApplication;
         obj["customName"] = customName;
+        obj["direction"] = direction;
+        obj["sinkDevice"] = sinkDevice;
+        obj["bufferSize"] = bufferSize;
+        obj["latencyTime"] = latencyTime;
+        obj["bufferTime"] = bufferTime;
         return obj;
     }
 
@@ -138,6 +149,11 @@ struct AudioStreamConfig
         cfg.sampleRate = obj["sampleRate"].toInt();
         cfg.opusApplication = obj["opusApplication"].toString();
         cfg.customName = obj["customName"].toString();
+        cfg.direction = obj["direction"].toString("outgoing"); // default outgoing
+        cfg.sinkDevice = obj["sinkDevice"].toString();
+        cfg.bufferSize = obj["bufferSize"].toInt(0);
+        cfg.latencyTime = obj["latencyTime"].toInt(0);
+        cfg.bufferTime = obj["bufferTime"].toInt(0);
         return cfg;
     }
 
@@ -151,6 +167,11 @@ struct AudioStreamConfig
         cfg.channels = 2;
         cfg.sampleRate = 48000;
         cfg.opusApplication = "audio";
+        cfg.direction = "outgoing"; // default direction
+        cfg.sinkDevice = "";        // empty = default sink
+        cfg.bufferSize = 4096;
+        cfg.latencyTime = 100;
+        cfg.bufferTime = 2000;
         return cfg;
     }
 };
@@ -378,16 +399,23 @@ public:
 
 private slots:
     void onCodecChanged(int index);
+    void onDirectionChanged(int index);
 
 private:
-    QLineEdit *editCustomName; // NEW
+    QLineEdit *editCustomName;
     QLineEdit *editHost;
+    QLabel *hostLabel; // to change text dynamically
     QSpinBox *spinPort;
     QComboBox *comboCodec;
     QSpinBox *spinBitrate;
     QSpinBox *spinChannels;
     QComboBox *comboSampleRate;
     QComboBox *comboOpusApplication;
+    QComboBox *comboDirection;
+    QLineEdit *editSinkDevice;
+    QSpinBox *spinBufferSize;
+    QSpinBox *spinLatencyTime;
+    QSpinBox *spinBufferTime;
 };
 
 AudioStreamDialog::AudioStreamDialog(QWidget *parent)
@@ -399,37 +427,64 @@ AudioStreamDialog::AudioStreamDialog(QWidget *parent)
     QVBoxLayout *mainLayout = new QVBoxLayout(this);
     QFormLayout *formLayout = new QFormLayout();
 
+    // ---- Advanced buffering options ----
+    QGroupBox *advancedGroup = new QGroupBox("⚙️ Advanced Buffer Settings (0 = default)", this);
+    QFormLayout *advancedLayout = new QFormLayout(advancedGroup);
+
     // ---- Custom stream name ----
     editCustomName = new QLineEdit();
     editCustomName->setPlaceholderText("Leave empty for auto-name (e.g. qt-caster-audio-1)");
     formLayout->addRow("📛 Stream Name:", editCustomName);
 
+    // ---- Direction ----
+    // In AudioStreamDialog constructor
+    comboDirection = new QComboBox();
+    comboDirection->addItem("📤 Outgoing (send microphone)", "outgoing");
+    comboDirection->addItem("📥 Incoming (receive & play)", "incoming");
+
+    connect(comboDirection, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
+            this, &AudioStreamDialog::onDirectionChanged);
+    formLayout->addRow("🔄 Direction:", comboDirection);
+
+    // ---- Host / Listen Address ----
+    hostLabel = new QLabel("🌐 Destination Host:"); // will be updated
     editHost = new QLineEdit();
     editHost->setText("192.168.178.91");
-    formLayout->addRow("🌐 Destination Host:", editHost);
+    formLayout->addRow(hostLabel, editHost);
 
+    // ---- Port ----
     spinPort = new QSpinBox();
     spinPort->setRange(1024, 65535);
     spinPort->setValue(5020);
-    formLayout->addRow("🔌 Destination Port:", spinPort);
+    formLayout->addRow("🔌 Port:", spinPort);
 
+    // ---- Sink Device (only for incoming) ----
+    editSinkDevice = new QLineEdit();
+    editSinkDevice->setPlaceholderText("e.g. Virtual-Music (leave empty for default sink)");
+    editSinkDevice->setEnabled(false); // initially disabled
+    formLayout->addRow("🎧 Sink Device:", editSinkDevice);
+
+    // ---- Codec ----:
     comboCodec = new QComboBox();
     comboCodec->addItem("🎵 Opus", "opus");
     comboCodec->addItem("🎶 AAC", "aac");
     formLayout->addRow("🎛 Codec:", comboCodec);
 
+    // ---- Bitrate ----
     spinBitrate = new QSpinBox();
     spinBitrate->setRange(16, 512);
     spinBitrate->setValue(128);
     spinBitrate->setSuffix(" kbps");
     formLayout->addRow("⚡ Bitrate:", spinBitrate);
 
+    // ---- Channels ----
     spinChannels = new QSpinBox();
     spinChannels->setRange(1, 8);
     spinChannels->setValue(2);
     spinChannels->setSuffix(" ch");
     formLayout->addRow("🎧 Channels:", spinChannels);
 
+    // ---- Sample Rate ----
     comboSampleRate = new QComboBox();
     comboSampleRate->addItem("48 kHz", 48000);
     comboSampleRate->addItem("44.1 kHz", 44100);
@@ -437,17 +492,40 @@ AudioStreamDialog::AudioStreamDialog(QWidget *parent)
     comboSampleRate->setCurrentIndex(0);
     formLayout->addRow("⏱ Sample Rate:", comboSampleRate);
 
+    // ---- Opus Application (only for Opus) ----
     comboOpusApplication = new QComboBox();
     comboOpusApplication->addItem("🎼 Audio", "audio");
     comboOpusApplication->addItem("🎤 VoIP", "voip");
     comboOpusApplication->addItem("⚡ Low Delay", "lowdelay");
     formLayout->addRow("📱 Application:", comboOpusApplication);
 
+    spinBufferSize = new QSpinBox();
+    spinBufferSize->setRange(0, 1048576); // 0 to 1 MB
+    spinBufferSize->setValue(4096);
+    spinBufferSize->setSuffix(" bytes");
+    spinBufferSize->setSpecialValueText("Auto");
+    advancedLayout->addRow("📦 Buffer Size:", spinBufferSize);
+
+    spinLatencyTime = new QSpinBox();
+    spinLatencyTime->setRange(0, 10000); // 0 to 10 seconds
+    spinLatencyTime->setValue(100);
+    spinLatencyTime->setSuffix(" ms");
+    spinLatencyTime->setSpecialValueText("Auto");
+    advancedLayout->addRow("⏱️ Latency Time:", spinLatencyTime);
+
+    spinBufferTime = new QSpinBox();
+    spinBufferTime->setRange(0, 10000);
+    spinBufferTime->setValue(2000);
+    spinBufferTime->setSuffix(" ms");
+    spinBufferTime->setSpecialValueText("Auto");
+    advancedLayout->addRow("⏱️ Buffer Time:", spinBufferTime);
+
     connect(comboCodec, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &AudioStreamDialog::onCodecChanged);
     onCodecChanged(0);
 
     mainLayout->addLayout(formLayout);
+    mainLayout->addWidget(advancedGroup);
 
     QDialogButtonBox *buttonBox = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -456,6 +534,24 @@ AudioStreamDialog::AudioStreamDialog(QWidget *parent)
     connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
     mainLayout->addWidget(buttonBox);
+}
+
+void AudioStreamDialog::onDirectionChanged(int index)
+{
+    bool incoming = (comboDirection->itemData(index).toString() == "incoming");
+    if (incoming)
+    {
+        hostLabel->setText("🌐 Listen Address:");
+        editHost->setText("0.0.0.0");
+        editSinkDevice->setEnabled(true);
+        // Port remains the same (listening port)
+    }
+    else
+    {
+        hostLabel->setText("🌐 Destination Host:");
+        editHost->setText("192.168.178.91");
+        editSinkDevice->setEnabled(false);
+    }
 }
 
 void AudioStreamDialog::onCodecChanged(int index)
@@ -485,6 +581,11 @@ AudioStreamConfig AudioStreamDialog::getConfig() const
     config.channels = spinChannels->value();
     config.sampleRate = comboSampleRate->currentData().toInt();
     config.opusApplication = comboOpusApplication->currentData().toString();
+    config.direction = comboDirection->currentData().toString();
+    config.sinkDevice = editSinkDevice->text().trimmed();
+    config.bufferSize = spinBufferSize->value();
+    config.latencyTime = spinLatencyTime->value();
+    config.bufferTime = spinBufferTime->value();
     return config;
 }
 

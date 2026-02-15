@@ -255,6 +255,7 @@ private:
     void launchGStreamerVideo(const QString &nodeId);
     void launchGStreamerAudio(const QString &nodeId);
     void setupSignalHandlers();
+    void startIncomingAudioStream();
     QList<LiveNodeDialog::NodeInfo> parsePipeWireVideoNodes(const QByteArray &jsonData);
     void showNodeSelectionDialog(const QList<LiveNodeDialog::NodeInfo> &nodes);
 
@@ -695,10 +696,111 @@ void StreamWorker::launchGStreamerVideo(const QString &nodeId)
 // ======================================================================
 // Audio Stream – Already working (channels up to 8)
 // ======================================================================
+void StreamWorker::startIncomingAudioStream()
+{
+    qDebug() << "📥 Starting incoming audio stream:" << streamName;
+
+    gstProcess = new QProcess(this);
+    connect(qApp, &QCoreApplication::aboutToQuit, this, &StreamWorker::cleanupAllProcesses);
+
+    QString host = config["host"].toString();
+    int port = config["port"].toInt();
+    QString codec = config["codec"].toString();
+    int channels = config["channels"].toInt();
+    int sampleRate = config["sampleRate"].toInt();
+    QString sinkDevice = config["sinkDevice"].toString();
+
+    QStringList args;
+    args << "udpsrc"
+         << QString("port=%1").arg(port)
+         << QString("address=%1").arg(host);
+
+    // Add buffer parameters to udpsrc
+    int bufferSize = config["bufferSize"].toInt(0);
+    int latencyTime = config["latencyTime"].toInt(0);
+    int bufferTime = config["bufferTime"].toInt(0);
+
+    if (bufferSize > 0)
+        args << QString("buffer-size=%1").arg(bufferSize);
+
+    // Set caps based on codec
+    if (codec == "opus")
+    {
+        args << "caps=application/x-rtp,media=audio,encoding-name=OPUS";
+        args << "!" << "rtpopusdepay"
+             << "!" << "opusdec"
+             << "!" << "audioconvert"
+             << "!" << "audioresample";
+    }
+    else if (codec == "aac")
+    {
+        args << "caps=application/x-rtp,media=audio,encoding-name=MP4A-LATM";
+        args << "!" << "rtpmp4gdepay"
+             << "!" << "avdec_aac"
+             << "!" << "audioconvert"
+             << "!" << "audioresample";
+    }
+    else
+    {
+        qCritical() << "❌ Unknown codec for incoming stream:" << codec;
+        QApplication::exit(1);
+        return;
+    }
+
+    // Force channel count and sample rate (optional, depends on stream)
+    // args << "!" << QString("audio/x-raw,channels=%1,rate=%2").arg(channels).arg(sampleRate);
+
+    // PulseAudio sink
+    QStringList pulsesinkArgs;
+    pulsesinkArgs << "pulsesink";
+    if (!sinkDevice.isEmpty())
+        pulsesinkArgs.last() += QString(" device=%1").arg(sinkDevice);
+
+    // pulsesink also supports latency-time and buffer-time
+    if (latencyTime > 0)
+        pulsesinkArgs << QString("latency-time=%1").arg(latencyTime);
+    if (bufferTime > 0)
+        pulsesinkArgs << QString("buffer-time=%1").arg(bufferTime);
+
+    args << "!" << pulsesinkArgs;
+
+    qDebug() << "🎵 Incoming GStreamer arguments:" << args;
+
+    gstProcess->setProcessChannelMode(QProcess::MergedChannels);
+    connect(gstProcess, &QProcess::readyRead, [this]()
+            {
+        QByteArray data = gstProcess->readAll();
+        if (!data.isEmpty())
+            qDebug().noquote() << "[GStreamer 📥]" << data.trimmed(); });
+    connect(gstProcess, &QProcess::started, []()
+            { qDebug() << "✅ Incoming GStreamer started"; });
+    connect(gstProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            [](int exitCode, QProcess::ExitStatus exitStatus)
+            {
+                qDebug() << "🏁 Incoming GStreamer finished:" << exitCode << exitStatus;
+                QApplication::exit(exitCode);
+            });
+    connect(gstProcess, &QProcess::errorOccurred, [](QProcess::ProcessError error)
+            {
+        qCritical() << "❌ Incoming GStreamer error:" << error;
+        QApplication::exit(1); });
+
+    gstProcess->start("gst-launch-1.0", args);
+}
+
 void StreamWorker::startAudioStream()
 {
     qDebug() << "🎤 Starting audio stream for:" << streamName;
-    findPipeWireNodeAndStartAudio();
+
+    QString direction = config["direction"].toString("outgoing");
+    if (direction == "incoming")
+    {
+        startIncomingAudioStream();
+    }
+    else
+    {
+        findPipeWireNodeAndStartAudio(); // existing outgoing logic
+    }
 }
 
 void StreamWorker::findPipeWireNodeAndStartAudio()
@@ -752,39 +854,43 @@ void StreamWorker::launchGStreamerAudio(const QString &nodeId)
     QString opusApplication = config["opusApplication"].toString();
 
     QStringList args;
-    args << "pipewiresrc"
-         << QString("path=%1").arg(nodeId)
-         << QString("stream-properties=p,media.name=%1").arg(streamName); // keep for audio
+    // pipewiresrc has a lot of syncing issues.
+    args << "pulsesrc"
+         << QString("name=%1").arg(streamName); // keep for audio
 
-    args << "!" << "audioconvert"
-         << "!" << "audioresample"
-         << "!" << QString("audio/x-raw,channels=%1,rate=%2").arg(channels).arg(sampleRate);
+    args
+        << "!" << QString("audio/x-raw,channels=%1").arg(channels)
+        << "!" << "audioconvert"
+        << "!" << "audioresample";
 
     if (codec == "opus")
     {
         args << "!" << "opusenc"
-             << QString("bitrate=%1").arg(bitrate * 1000)
+             //  << QString("bitrate=%1").arg(bitrate * 1000)
              //  << QString("application=%1").arg(opusApplication)
-             << "!" << "rtpopuspay"
-             << "pt=97";
+             << "!" << "rtpopuspay";
+        //  << "pt=97";
     }
-    else if (codec == "aac")
-    {
-        args << "!" << "avenc_aac"
-             << QString("bitrate=%1").arg(bitrate * 1000)
-             << "!" << "rtpmp4gpay"
-             << "pt=96";
-    }
-    else
-    {
-        qCritical() << "❌ Unknown codec:" << codec;
-        QApplication::exit(1);
-        return;
-    }
+    // else if (codec == "aac")
+    // {
+    //     args << "!" << "avenc_aac"
+    //          << QString("bitrate=%1").arg(bitrate * 1000)
+    //          << "!" << "rtpmp4gpay"
+    //          << "pt=96";
+    // }
+    // else
+    // {
+    //     qCritical() << "❌ Unknown codec:" << codec;
+    //     QApplication::exit(1);
+    //     return;
+    // }
 
-    args << "!" << "udpsink"
-         << QString("host=%1").arg(host)
-         << QString("port=%1").arg(port);
+    QStringList udpsinkArgs;
+    udpsinkArgs << "udpsink"
+                << QString("host=%1").arg(host)
+                << QString("port=%1").arg(port);
+
+    args << "!" << udpsinkArgs;
 
     qDebug() << "🎵 GStreamer arguments:" << args;
 
