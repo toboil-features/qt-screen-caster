@@ -251,7 +251,8 @@ private slots:
 private:
     void startVideoStream();
     void startAudioStream();
-    void findPipeWireNodeAndStartAudio();
+    // void findPipeWireNodeAndStartAudio();
+    void startPulseAudioStream();
     void launchGStreamerVideo(const QString &nodeId);
     void launchGStreamerAudio(const QString &nodeId);
     void setupSignalHandlers();
@@ -749,12 +750,13 @@ void StreamWorker::startIncomingAudioStream()
 
     // Force channel count and sample rate (optional, depends on stream)
     // args << "!" << QString("audio/x-raw,channels=%1,rate=%2").arg(channels).arg(sampleRate);
+    // gst-launch-1.0 audiotestsrc ! audioconvert ! pulsesink stream-properties="media.name=custom-probe-stream"=virtsink
 
     // PulseAudio sink
     QStringList pulsesinkArgs;
-    pulsesinkArgs << "pulsesink";
-    if (!sinkDevice.isEmpty())
-        pulsesinkArgs.last() += QString(" device=%1").arg(sinkDevice);
+    pulsesinkArgs << "pulsesink"
+                  << QString("client-name=%1").arg(streamName)                         // PulseAudio client name
+                  << QString("stream-properties=props,media.name=%1").arg(streamName); // Stream name
 
     // pulsesink also supports latency-time and buffer-time
     if (latencyTime > 0)
@@ -799,48 +801,14 @@ void StreamWorker::startAudioStream()
     }
     else
     {
-        findPipeWireNodeAndStartAudio(); // existing outgoing logic
+        // findPipeWireNodeAndStartAudio(); // existing outgoing logic
+        startPulseAudioStream();
     }
 }
 
-void StreamWorker::findPipeWireNodeAndStartAudio()
+void StreamWorker::startPulseAudioStream()
 {
-    qDebug() << "🔍 Finding PipeWire audio node...";
-
-    pwDumpProcess = new QProcess(this);
-    QString command = "pw-dump | jq -r '[.[] | select(.info.props.\"media.class\" == \"Audio/Source\") | select(.id != null) | .id] | .[0] // empty'";
-    pwDumpProcess->start("bash", QStringList() << "-c" << command);
-
-    connect(pwDumpProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            [this](int exitCode, QProcess::ExitStatus exitStatus)
-            {
-                if (exitStatus == QProcess::NormalExit && exitCode == 0)
-                {
-                    QString nodeId = QString(pwDumpProcess->readAllStandardOutput()).trimmed();
-                    if (!nodeId.isEmpty() && nodeId != "null" && nodeId.toInt() > 0)
-                    {
-                        qDebug() << "✅ Found PipeWire audio node:" << nodeId;
-                        launchGStreamerAudio(nodeId);
-                    }
-                    else
-                    {
-                        qCritical() << "❌ Could not find valid PipeWire audio node";
-                        QApplication::exit(1);
-                    }
-                }
-                else
-                {
-                    qCritical() << "❌ pw-dump failed:" << exitStatus << exitCode;
-                    QApplication::exit(1);
-                }
-                pwDumpProcess->deleteLater();
-                pwDumpProcess = nullptr;
-            });
-}
-
-void StreamWorker::launchGStreamerAudio(const QString &nodeId)
-{
-    qDebug() << "🚀 Launching GStreamer for audio stream:" << streamName;
+    qDebug() << "📤 Starting outgoing audio stream with pulsesrc:" << streamName;
 
     gstProcess = new QProcess(this);
     connect(qApp, &QCoreApplication::aboutToQuit, this, &StreamWorker::cleanupAllProcesses);
@@ -854,41 +822,57 @@ void StreamWorker::launchGStreamerAudio(const QString &nodeId)
     QString opusApplication = config["opusApplication"].toString();
 
     QStringList args;
-    // pipewiresrc has a lot of syncing issues.
+    // Use pulsesrc with custom name
     args << "pulsesrc"
-         << QString("name=%1").arg(streamName); // keep for audio
+         << QString("client-name=%1").arg(streamName); // PulseAudio client name
+    args << QString("stream-properties=props,media.name=%1").arg(streamName);
+
+    // Optional: specify device if needed (default source)
+    // args << "device=alsa_input.pci-0000_00_1f.3.analog-stereo";
 
     args
-        << "!" << QString("audio/x-raw,channels=%1").arg(channels)
         << "!" << "audioconvert"
-        << "!" << "audioresample";
+        << "!" << "audioresample"
+        << "!" << QString("audio/x-raw,channels=%1,rate=%2").arg(channels).arg(sampleRate);
 
+    // Codec-specific
     if (codec == "opus")
     {
         args << "!" << "opusenc"
-             //  << QString("bitrate=%1").arg(bitrate * 1000)
-             //  << QString("application=%1").arg(opusApplication)
-             << "!" << "rtpopuspay";
-        //  << "pt=97";
+             << QString("bitrate=%1").arg(bitrate * 1000)
+             << "!" << "rtpopuspay"
+             << "pt=97";
     }
-    // else if (codec == "aac")
-    // {
-    //     args << "!" << "avenc_aac"
-    //          << QString("bitrate=%1").arg(bitrate * 1000)
-    //          << "!" << "rtpmp4gpay"
-    //          << "pt=96";
-    // }
-    // else
-    // {
-    //     qCritical() << "❌ Unknown codec:" << codec;
-    //     QApplication::exit(1);
-    //     return;
-    // }
+    else if (codec == "aac")
+    {
+        args << "!" << "avenc_aac"
+             << QString("bitrate=%1").arg(bitrate * 1000)
+             << "!" << "rtpmp4gpay"
+             << "pt=96";
+    }
+    else
+    {
+        qCritical() << "❌ Unknown codec:" << codec;
+        QApplication::exit(1);
+        return;
+    }
 
+    // udpsink with optional buffer parameters
     QStringList udpsinkArgs;
     udpsinkArgs << "udpsink"
                 << QString("host=%1").arg(host)
                 << QString("port=%1").arg(port);
+
+    int bufferSize = config["bufferSize"].toInt(0);
+    int latencyTime = config["latencyTime"].toInt(0);
+    int bufferTime = config["bufferTime"].toInt(0);
+
+    if (bufferSize > 0)
+        udpsinkArgs << QString("buffer-size=%1").arg(bufferSize);
+    // if (latencyTime > 0)
+    //     udpsinkArgs << QString("latency-time=%1").arg(latencyTime);
+    // if (bufferTime > 0)
+    // udpsinkArgs << QString("buffer-time=%1").arg(bufferTime);
 
     args << "!" << udpsinkArgs;
 
@@ -899,22 +883,136 @@ void StreamWorker::launchGStreamerAudio(const QString &nodeId)
             {
         QByteArray data = gstProcess->readAll();
         if (!data.isEmpty())
-            qDebug().noquote() << "[GStreamer 🎤]" << data.trimmed(); });
+            qDebug().noquote() << "[GStreamer 📤]" << data.trimmed(); });
     connect(gstProcess, &QProcess::started, []()
-            { qDebug() << "✅ GStreamer started successfully"; });
+            { qDebug() << "✅ Outgoing audio started"; });
     connect(gstProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             [](int exitCode, QProcess::ExitStatus exitStatus)
             {
-                qDebug() << "🏁 GStreamer finished:" << exitCode << exitStatus;
+                qDebug() << "🏁 Outgoing audio finished:" << exitCode << exitStatus;
                 QApplication::exit(exitCode);
             });
     connect(gstProcess, &QProcess::errorOccurred, [](QProcess::ProcessError error)
             {
-        qCritical() << "❌ GStreamer error:" << error;
+        qCritical() << "❌ Outgoing audio error:" << error;
         QApplication::exit(1); });
 
     gstProcess->start("gst-launch-1.0", args);
 }
+
+// void StreamWorker::findPipeWireNodeAndStartAudio()
+// {
+//     qDebug() << "🔍 Finding PipeWire audio node...";
+
+//     pwDumpProcess = new QProcess(this);
+//     QString command = "pw-dump | jq -r '[.[] | select(.info.props.\"media.class\" == \"Audio/Source\") | select(.id != null) | .id] | .[0] // empty'";
+//     pwDumpProcess->start("bash", QStringList() << "-c" << command);
+
+//     connect(pwDumpProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+//             [this](int exitCode, QProcess::ExitStatus exitStatus)
+//             {
+//                 if (exitStatus == QProcess::NormalExit && exitCode == 0)
+//                 {
+//                     QString nodeId = QString(pwDumpProcess->readAllStandardOutput()).trimmed();
+//                     if (!nodeId.isEmpty() && nodeId != "null" && nodeId.toInt() > 0)
+//                     {
+//                         qDebug() << "✅ Found PipeWire audio node:" << nodeId;
+//                         launchGStreamerAudio(nodeId);
+//                     }
+//                     else
+//                     {
+//                         qCritical() << "❌ Could not find valid PipeWire audio node";
+//                         QApplication::exit(1);
+//                     }
+//                 }
+//                 else
+//                 {
+//                     qCritical() << "❌ pw-dump failed:" << exitStatus << exitCode;
+//                     QApplication::exit(1);
+//                 }
+//                 pwDumpProcess->deleteLater();
+//                 pwDumpProcess = nullptr;
+//             });
+// }
+
+// void StreamWorker::launchGStreamerAudio(const QString &nodeId)
+// {
+//     qDebug() << "🚀 Launching GStreamer for audio stream:" << streamName;
+
+//     gstProcess = new QProcess(this);
+//     connect(qApp, &QCoreApplication::aboutToQuit, this, &StreamWorker::cleanupAllProcesses);
+
+//     QString host = config["host"].toString();
+//     int port = config["port"].toInt();
+//     QString codec = config["codec"].toString();
+//     int bitrate = config["bitrate"].toInt();
+//     int channels = config["channels"].toInt();
+//     int sampleRate = config["sampleRate"].toInt();
+//     QString opusApplication = config["opusApplication"].toString();
+
+//     QStringList args;
+//     // pipewiresrc has a lot of syncing issues.
+//     args << "pulsesrc"
+//          << QString("client-name=xxx")
+//          << QString("name=%1").arg(streamName); // keep for audio
+
+//     args
+//         << "!" << QString("audio/x-raw,channels=%1").arg(channels)
+//         << "!" << "audioconvert"
+//         << "!" << "audioresample";
+
+//     if (codec == "opus")
+//     {
+//         args << "!" << "opusenc"
+//              //  << QString("bitrate=%1").arg(bitrate * 1000)
+//              //  << QString("application=%1").arg(opusApplication)
+//              << "!" << "rtpopuspay";
+//         //  << "pt=97";
+//     }
+//     // else if (codec == "aac")
+//     // {
+//     //     args << "!" << "avenc_aac"
+//     //          << QString("bitrate=%1").arg(bitrate * 1000)
+//     //          << "!" << "rtpmp4gpay"
+//     //          << "pt=96";
+//     // }
+//     // else
+//     // {
+//     //     qCritical() << "❌ Unknown codec:" << codec;
+//     //     QApplication::exit(1);
+//     //     return;
+//     // }
+
+//     QStringList udpsinkArgs;
+//     udpsinkArgs << "udpsink"
+//                 << QString("host=%1").arg(host)
+//                 << QString("port=%1").arg(port);
+
+//     args << "!" << udpsinkArgs;
+
+//     qDebug() << "🎵 GStreamer arguments:" << args;
+
+//     gstProcess->setProcessChannelMode(QProcess::MergedChannels);
+//     connect(gstProcess, &QProcess::readyRead, [this]()
+//             {
+//         QByteArray data = gstProcess->readAll();
+//         if (!data.isEmpty())
+//             qDebug().noquote() << "[GStreamer 🎤]" << data.trimmed(); });
+//     connect(gstProcess, &QProcess::started, []()
+//             { qDebug() << "✅ GStreamer started successfully"; });
+//     connect(gstProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+//             [](int exitCode, QProcess::ExitStatus exitStatus)
+//             {
+//                 qDebug() << "🏁 GStreamer finished:" << exitCode << exitStatus;
+//                 QApplication::exit(exitCode);
+//             });
+//     connect(gstProcess, &QProcess::errorOccurred, [](QProcess::ProcessError error)
+//             {
+//         qCritical() << "❌ GStreamer error:" << error;
+//         QApplication::exit(1); });
+
+//     gstProcess->start("gst-launch-1.0", args);
+// }
 
 // ======================================================================
 // Utility: Parse PipeWire video nodes

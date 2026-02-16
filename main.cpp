@@ -1118,9 +1118,9 @@ void StreamManager::onWorkerOutput()
         QString output = worker->readAllStandardOutput();
         QString error = worker->readAllStandardError();
         if (!output.isEmpty())
-            qDebug().noquote() << "[Worker 📤]" << output.trimmed();
+            qDebug().noquote() << "[Worker]" << output.trimmed();
         if (!error.isEmpty())
-            qDebug().noquote() << "[Worker ❌]" << error.trimmed();
+            qDebug().noquote() << "[Worker]" << error.trimmed();
     }
 }
 
